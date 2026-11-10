@@ -1,0 +1,5 @@
+[flake8]
+max-line-length = 120
+select = B,C,E,F,W,B9
+# Black's formatting
+extend-ignore = E203,W503

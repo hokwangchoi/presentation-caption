@@ -1,0 +1,8 @@
+# Settings of the formatter and the type checker; the dependencies are in requirements.txt.
+[tool.black]
+line-length = 120
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
