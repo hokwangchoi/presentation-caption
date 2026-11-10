@@ -1,1 +1,2 @@
 pywhispercpp>=1.3
+Pillow>=10.1

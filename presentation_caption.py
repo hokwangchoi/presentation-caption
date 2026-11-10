@@ -1,28 +1,38 @@
-"""Live captions for presentations: transcribes the microphone with Whisper, locally, and prints each sentence
-when you pause.
+"""Live captions for presentations: transcribes the microphone with Whisper, locally, and shows the text on top of
+every window, so sharing the whole screen shares the captions too.
 
 Run:   python3 presentation_caption.py
-Quit:  Ctrl+C.
+Hover over the captions to show their controls: font size, close, and a resize corner. Drag them to move.
+Quit:  the close button, right-click, or Ctrl+C in the terminal.
+
+The transcript is also printed to the terminal, one line per sentence.
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import ctypes
+import ctypes.util
 import os
 import queue
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 import wave
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
+    import tkinter as tk
+
+    from PIL import Image, ImageFont
     from pywhispercpp.model import Model, Segment
 
 Audio = npt.NDArray[np.float32]
@@ -35,6 +45,9 @@ HALLUCINATION = re.compile(
     r"^\s*[\[(].*[\])]\s*$",
     re.I,
 )
+# Black letters with a white outline: readable on bright and dark parts of the slides
+TEXT_COLOR = "black"
+OUTLINE_COLOR = "white"
 
 
 def load_model(name: str, threads: int, models_dir: str | None) -> Model:
@@ -157,6 +170,252 @@ class Captioner:
             self.partial = partial
 
 
+class Shape:
+    """Cuts an X11 window to a mask with the X Shape extension, so only the drawn pixels show and get the mouse.
+    Unlike a transparent background, it needs no compositor."""
+
+    def __init__(self) -> None:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        xext = ctypes.CDLL(ctypes.util.find_library("Xext") or "libXext.so.6")
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XCreateBitmapFromData.restype = ctypes.c_ulong
+        x11.XCreateBitmapFromData.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        x11.XFreePixmap.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        x11.XFree.argtypes = [ctypes.c_void_p]
+        x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong, *[ctypes.c_void_p] * 4]
+        xext.XShapeCombineMask.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_int,
+        ]
+        self.x11 = x11
+        self.xext = xext
+        self.display = x11.XOpenDisplay(None)
+
+    def top(self, window: int) -> int:
+        """The ancestor of `window` that is a child of the root window, the one X shows: Tk wraps its windows."""
+        root, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        children, count = ctypes.c_void_p(), ctypes.c_uint()
+        while True:
+            refs = (ctypes.byref(root), ctypes.byref(parent), ctypes.byref(children), ctypes.byref(count))
+            self.x11.XQueryTree(self.display, window, *refs)
+            if children:
+                self.x11.XFree(children)
+            if parent.value in (0, root.value):
+                return window
+            window = parent.value
+
+    def set(self, window: int, mask: npt.NDArray[np.bool_] | None) -> None:
+        """Shows only the pixels of `window` where `mask` is true, or all of them if it is None."""
+        window = self.top(window)
+        bounding, set_op = 0, 0  # ShapeBounding, ShapeSet
+        if mask is None:
+            self.xext.XShapeCombineMask(self.display, window, bounding, 0, 0, 0, set_op)
+        else:
+            height, width = mask.shape
+            bits = np.packbits(mask, axis=1, bitorder="little").tobytes()  # rows of X bitmap data
+            pixmap = self.x11.XCreateBitmapFromData(self.display, window, bits, width, height)
+            self.xext.XShapeCombineMask(self.display, window, bounding, 0, 0, pixmap, set_op)
+            self.x11.XFreePixmap(self.display, pixmap)
+        self.x11.XFlush(self.display)
+
+
+def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """A bold sans-serif font, from fontconfig if available."""
+    from PIL import ImageFont
+
+    if shutil.which("fc-match"):
+        path = subprocess.run(["fc-match", "-f", "%{file}", "sans:bold"], capture_output=True, text=True).stdout
+        if path:
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default(size)
+
+
+def monitor_at(x: int, y: int) -> tuple[int, int, int, int] | None:
+    """`(x, y, width, height)` of the monitor showing the point, from xrandr, or None."""
+    try:
+        out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True).stdout
+    except OSError:
+        return None
+    for m in re.finditer(r"(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", out):
+        w, h, mx, my = map(int, m.groups())
+        if mx <= x < mx + w and my <= y < my + h:
+            return mx, my, w, h
+    return None
+
+
+class CaptionWindow:
+    """The last lines of captions that fit, across the monitor under the mouse, on top of every window. The letters
+    are drawn with Pillow and the window is cut to their shape. Hovering shows a solid bar with the controls."""
+
+    PAD = 16
+    GRIP = 20
+
+    def __init__(self, captioner: Captioner, font_size: int, lines: int, position: str) -> None:
+        import tkinter as tk
+
+        self.captioner = captioner
+        self.font_size = font_size
+        self.font = load_font(font_size)
+        self.text = ""
+        self.hovered = False
+        self.drag_offset: tuple[int, int] | None = None
+        self.shape = Shape()
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)  # not framed or tiled by the window manager
+        self.root.attributes("-topmost", True)
+        self.label = tk.Label(self.root, borderwidth=0, highlightthickness=0)
+        self.label.pack(fill="both", expand=True)
+        self.buttons = [
+            self._button("A-", lambda: self.zoom(-4)),
+            self._button("A+", lambda: self.zoom(4)),
+            self._button("Close", self.root.destroy),
+        ]
+        self.grip = tk.Frame(self.root, width=self.GRIP, height=self.GRIP, bg="darkgray", cursor="bottom_right_corner")
+        screen = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        mx, my, width, mh = monitor_at(*self.root.winfo_pointerxy()) or screen
+        height = lines * self.line_height() + 2 * self.PAD
+        y = my + 60 if position == "top" else my + mh - height - 60
+        self.root.geometry(f"{width}x{height}+{mx}+{y}")
+        self.size = (width, height)
+        self.image: object = None  # the PhotoImage shown, kept from garbage collection
+        self.label.bind("<Enter>", self.enter)
+        self.root.bind("<Leave>", self.leave)
+        self.label.bind("<Button-1>", self.press)
+        self.label.bind("<B1-Motion>", self.move)
+        self.label.bind("<ButtonRelease-1>", self.release)
+        self.grip.bind("<B1-Motion>", self.resize)
+        self.label.bind("<Button-4>", lambda e: self.zoom(4))  # scroll up and down
+        self.label.bind("<Button-5>", lambda e: self.zoom(-4))
+        self.label.bind("<Button-3>", lambda e: self.root.destroy())
+        self.root.after(50, self.refresh)
+
+    def _button(self, label: str, action: Callable[[], object]) -> tk.Button:
+        import tkinter as tk
+
+        return tk.Button(self.root, text=label, command=action, padx=6, pady=0, cursor="hand2")
+
+    def run(self) -> None:
+        signal.signal(signal.SIGINT, lambda *_: self.root.destroy())  # Ctrl+C, handled when `refresh` runs
+        self.root.mainloop()
+
+    def line_height(self) -> int:
+        return int(self.font.getbbox("Ag")[3] * 1.2)
+
+    def refresh(self) -> None:
+        text = self.captioner.text()
+        size = (self.root.winfo_width(), self.root.winfo_height())
+        if text != self.text or size != self.size:
+            self.text, self.size = text, size
+            self.redraw()
+        self.root.lift()
+        self.root.after(150, self.refresh)
+
+    def zoom(self, step: int) -> None:
+        self.font_size = max(16, min(160, self.font_size + step))
+        self.font = load_font(self.font_size)
+        self.redraw()
+
+    def lines(self) -> list[str]:
+        """The last lines of the text that fit, wrapped to the width left of the buttons, so that showing them
+        does not cover the text."""
+        buttons = sum(b.winfo_reqwidth() + 6 for b in self.buttons) + self.GRIP + 8
+        width = self.size[0] - self.PAD - buttons
+        fit = max(1, (self.size[1] - 2 * self.PAD) // self.line_height())
+        out: list[str] = []
+        line = ""
+        for word in self.text.split():
+            if line and self.font.getlength(line + " " + word) > width:
+                out.append(line)
+                line = word
+            else:
+                line = f"{line} {word}".strip()
+        return (out + [line])[-fit:]
+
+    def draw(self) -> Image.Image:
+        """The captions as an image, transparent where the window is cut away."""
+        from PIL import Image, ImageDraw
+
+        width, height = self.size
+        back = "gray" if self.hovered else None
+        image = Image.new("RGBA", (width, height), back or (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        lines = self.lines()
+        stroke = max(2, self.font_size // 14)
+        for i, line in enumerate(lines):
+            y = height - self.PAD - (len(lines) - i) * self.line_height()
+            draw.text(
+                (self.PAD, y), line, font=self.font, fill=TEXT_COLOR, stroke_width=stroke, stroke_fill=OUTLINE_COLOR
+            )
+        if not self.text and not back:  # a handle to hover and grab, as the window is invisible without text
+            draw.rectangle((0, height - 12, 12, height), fill="gray")
+        return image
+
+    def redraw(self) -> None:
+        from PIL import ImageTk
+
+        image = self.draw()
+        photo = ImageTk.PhotoImage(image)
+        self.label.configure(image=photo)
+        self.image = photo
+        self.root.update_idletasks()
+        window = int(self.root.wm_frame(), 16)
+        if self.hovered:
+            self.shape.set(window, None)
+        else:
+            self.shape.set(window, np.asarray(image.getchannel("A")) > 127)
+
+    def enter(self, event: tk.Event[tk.Misc]) -> None:
+        if self.hovered:
+            return
+        self.hovered = True
+        x = self.size[0] - self.GRIP - 8
+        for button in reversed(self.buttons):
+            x -= button.winfo_reqwidth() + 6
+            button.place(x=x, y=6)
+        self.grip.place(relx=1.0, rely=1.0, anchor="se")
+        self.redraw()
+
+    def leave(self, event: tk.Event[tk.Misc]) -> None:
+        px, py = self.root.winfo_pointerxy()
+        x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        if self.drag_offset or (x <= px < x + self.size[0] and y <= py < y + self.size[1]):
+            return  # onto a button, or dragging
+        self.hovered = False
+        for widget in [*self.buttons, self.grip]:
+            widget.place_forget()
+        self.redraw()
+
+    def press(self, event: tk.Event[tk.Misc]) -> None:
+        self.drag_offset = (event.x, event.y)
+
+    def move(self, event: tk.Event[tk.Misc]) -> None:
+        if self.drag_offset:
+            x = self.root.winfo_x() + event.x - self.drag_offset[0]
+            y = self.root.winfo_y() + event.y - self.drag_offset[1]
+            self.root.geometry(f"+{x}+{y}")
+
+    def release(self, event: tk.Event[tk.Misc]) -> None:
+        self.drag_offset = None
+
+    def resize(self, event: tk.Event[tk.Misc]) -> None:
+        width = max(300, event.x_root - self.root.winfo_rootx())
+        height = max(self.line_height() + 2 * self.PAD, event.y_root - self.root.winfo_rooty())
+        self.root.geometry(f"{width}x{height}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument(
@@ -171,6 +430,10 @@ def main() -> None:
         "--source", help="PulseAudio source, see `pactl list short sources` (default: the default microphone)"
     )
     parser.add_argument("--file", help="a 16 kHz mono WAV file instead of the microphone, for testing")
+    parser.add_argument("--font-size", type=int, default=40, help="in pixels (default %(default)s)")
+    parser.add_argument("--lines", type=int, default=2, help="height of the window at start, in lines")
+    parser.add_argument("--position", choices=["bottom", "top"], default="bottom")
+    parser.add_argument("--no-window", action="store_true", help="only print the transcript")
     args = parser.parse_args()
 
     model = load_model(args.model, args.threads, args.models_dir)
@@ -184,7 +447,10 @@ def main() -> None:
     reader.start()
     threading.Thread(target=captioner.run, args=(chunks,), daemon=True).start()
     try:
-        reader.join()
+        if args.no_window:
+            reader.join()
+        else:
+            CaptionWindow(captioner, args.font_size, args.lines, args.position).run()
     except KeyboardInterrupt:
         pass
 
