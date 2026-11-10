@@ -1,7 +1,7 @@
 """Live captions for presentations: transcribes the microphone with Whisper, locally, and shows the text on top of
 every window, so sharing the whole screen shares the captions too.
 
-Run:   python3 presentation_caption.py
+Run:   python3 presentation_caption.py [--vocab words.txt]
 Hover over the captions to show their controls: colors, font size, close, and a resize corner. Drag them to move.
 Quit:  the close button, right-click, or Ctrl+C in the terminal.
 
@@ -68,6 +68,14 @@ def load_model(name: str, threads: int, models_dir: str | None) -> Model:
     )
 
 
+def load_vocab(path: str | None) -> list[str]:
+    """The terms of a vocabulary file: one per line, `#` starts a comment."""
+    if not path:
+        return []
+    with open(path) as f:
+        return [term for line in f if (term := line.split("#")[0].strip())]
+
+
 def to_audio(pcm: bytes) -> Audio:
     """16-bit PCM bytes as floats in [-1, 1]."""
     return (np.frombuffer(pcm, np.int16) / 32768).astype(np.float32)
@@ -100,9 +108,12 @@ def read_file(path: str, chunks: queue.Queue[Audio]) -> None:
 class Captioner:
     """Turns the audio stream into sentences (`done`) and the sentence being spoken (`partial`)."""
 
-    def __init__(self, model: Model, language: str) -> None:
+    def __init__(self, model: Model, language: str, vocab: list[str]) -> None:
         self.model = model
         self.language = language
+        # Whisper spells the terms of its prompt right more often, and the rest are fixed after (Numpy -> NumPy)
+        self.prompt = ", ".join(vocab) + "." if vocab else ""
+        self.fixes = [(re.compile(rf"(?<!\w){re.escape(t)}(?!\w)", re.I), t) for t in vocab if t != t.lower()]
         # Loudness of the last 10 s of 20 ms frames, to tell speech from the room's noise
         self.levels: collections.deque[float] = collections.deque(maxlen=50 * 10)
         self.done: list[str] = []
@@ -159,11 +170,16 @@ class Captioner:
         return speech
 
     def _transcribe(self, audio: Audio) -> list[Segment]:
-        segments = self.model.transcribe(audio, language=self.language, no_context=True, suppress_blank=True)
+        segments = self.model.transcribe(
+            audio, language=self.language, initial_prompt=self.prompt, no_context=True, suppress_blank=True
+        )
         return [s for s in segments if s.text.strip() and not HALLUCINATION.search(s.text)]
 
     def _join(self, segments: list[Segment]) -> str:
-        return " ".join(s.text.strip() for s in segments).strip()
+        text = " ".join(s.text.strip() for s in segments).strip()
+        for pattern, term in self.fixes:
+            text = pattern.sub(term, text)
+        return text
 
     def _commit(self, segments: list[Segment], partial: str = "") -> None:
         text = self._join(segments)
@@ -435,6 +451,7 @@ def main() -> None:
     parser.add_argument(
         "--language", default="en", help="spoken language (default %(default)s); models ending in .en are English only"
     )
+    parser.add_argument("--vocab", help="file of terms of the talk, one per line, to spell them right")
     parser.add_argument("--threads", type=int, default=min(8, os.cpu_count() or 4), help="CPU threads for Whisper")
     parser.add_argument("--models-dir", help="where Whisper models are downloaded (default: the user data folder)")
     parser.add_argument(
@@ -454,7 +471,7 @@ def main() -> None:
     args = parser.parse_args()
 
     model = load_model(args.model, args.threads, args.models_dir)
-    captioner = Captioner(model, args.language)
+    captioner = Captioner(model, args.language, load_vocab(args.vocab))
     print(f"Captions with Whisper {args.model}. Speak.", file=sys.stderr)
     chunks: queue.Queue[Audio] = queue.Queue()
     if args.file:

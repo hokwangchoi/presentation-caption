@@ -1,0 +1,10 @@
+# Terms of a talk on a web service: Whisper gets them in its prompt, and their spelling is fixed in the captions.
+Docker
+Kubernetes
+kubectl
+FastAPI
+PostgreSQL
+gRPC
+GitHub Actions
+Prometheus
+Grafana
