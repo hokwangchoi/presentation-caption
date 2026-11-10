@@ -2,7 +2,7 @@
 every window, so sharing the whole screen shares the captions too.
 
 Run:   python3 presentation_caption.py
-Hover over the captions to show their controls: font size, close, and a resize corner. Drag them to move.
+Hover over the captions to show their controls: colors, font size, close, and a resize corner. Drag them to move.
 Quit:  the close button, right-click, or Ctrl+C in the terminal.
 
 The transcript is also printed to the terminal, one line per sentence.
@@ -45,9 +45,13 @@ HALLUCINATION = re.compile(
     r"^\s*[\[(].*[\])]\s*$",
     re.I,
 )
-# Black letters with a white outline: readable on bright and dark parts of the slides
-TEXT_COLOR = "black"
-OUTLINE_COLOR = "white"
+# Color schemes, in the order of the colors button: text, its outline and the background (None: transparent)
+SCHEMES: dict[str, tuple[str, str | None, str | None]] = {
+    "black-outlined": ("black", "white", None),
+    "white-outlined": ("white", "black", None),
+    "black-on-white": ("black", None, "white"),
+    "white-on-black": ("white", None, "black"),
+}
 
 
 def load_model(name: str, threads: int, models_dir: str | None) -> Model:
@@ -263,10 +267,11 @@ class CaptionWindow:
     PAD = 16
     GRIP = 20
 
-    def __init__(self, captioner: Captioner, font_size: int, lines: int, position: str) -> None:
+    def __init__(self, captioner: Captioner, font_size: int, lines: int, position: str, colors: str) -> None:
         import tkinter as tk
 
         self.captioner = captioner
+        self.scheme = colors
         self.font_size = font_size
         self.font = load_font(font_size)
         self.text = ""
@@ -279,6 +284,7 @@ class CaptionWindow:
         self.label = tk.Label(self.root, borderwidth=0, highlightthickness=0)
         self.label.pack(fill="both", expand=True)
         self.buttons = [
+            self._button("Colors", self.next_scheme),
             self._button("A-", lambda: self.zoom(-4)),
             self._button("A+", lambda: self.zoom(4)),
             self._button("Close", self.root.destroy),
@@ -323,6 +329,12 @@ class CaptionWindow:
         self.root.lift()
         self.root.after(150, self.refresh)
 
+    def next_scheme(self) -> None:
+        names = list(SCHEMES)
+        self.scheme = names[(names.index(self.scheme) + 1) % len(names)]
+        print(f"Colors: {self.scheme}", file=sys.stderr)
+        self.redraw()
+
     def zoom(self, step: int) -> None:
         self.font_size = max(16, min(160, self.font_size + step))
         self.font = load_font(self.font_size)
@@ -348,17 +360,16 @@ class CaptionWindow:
         """The captions as an image, transparent where the window is cut away."""
         from PIL import Image, ImageDraw
 
+        fg, outline, bg = SCHEMES[self.scheme]
         width, height = self.size
-        back = "gray" if self.hovered else None
+        back = "gray" if self.hovered else bg
         image = Image.new("RGBA", (width, height), back or (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         lines = self.lines()
-        stroke = max(2, self.font_size // 14)
+        stroke = max(2, self.font_size // 14) if outline else 0
         for i, line in enumerate(lines):
             y = height - self.PAD - (len(lines) - i) * self.line_height()
-            draw.text(
-                (self.PAD, y), line, font=self.font, fill=TEXT_COLOR, stroke_width=stroke, stroke_fill=OUTLINE_COLOR
-            )
+            draw.text((self.PAD, y), line, font=self.font, fill=fg, stroke_width=stroke, stroke_fill=outline)
         if not self.text and not back:  # a handle to hover and grab, as the window is invisible without text
             draw.rectangle((0, height - 12, 12, height), fill="gray")
         return image
@@ -372,7 +383,7 @@ class CaptionWindow:
         self.image = photo
         self.root.update_idletasks()
         window = int(self.root.wm_frame(), 16)
-        if self.hovered:
+        if self.hovered or SCHEMES[self.scheme][2]:
             self.shape.set(window, None)
         else:
             self.shape.set(window, np.asarray(image.getchannel("A")) > 127)
@@ -430,6 +441,12 @@ def main() -> None:
         "--source", help="PulseAudio source, see `pactl list short sources` (default: the default microphone)"
     )
     parser.add_argument("--file", help="a 16 kHz mono WAV file instead of the microphone, for testing")
+    parser.add_argument(
+        "--colors",
+        choices=list(SCHEMES),
+        default="black-outlined",
+        help="color scheme at start, also changed with the colors button (default %(default)s)",
+    )
     parser.add_argument("--font-size", type=int, default=40, help="in pixels (default %(default)s)")
     parser.add_argument("--lines", type=int, default=2, help="height of the window at start, in lines")
     parser.add_argument("--position", choices=["bottom", "top"], default="bottom")
@@ -450,7 +467,7 @@ def main() -> None:
         if args.no_window:
             reader.join()
         else:
-            CaptionWindow(captioner, args.font_size, args.lines, args.position).run()
+            CaptionWindow(captioner, args.font_size, args.lines, args.position, args.colors).run()
     except KeyboardInterrupt:
         pass
 
