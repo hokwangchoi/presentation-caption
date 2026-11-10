@@ -2,9 +2,10 @@
 Docker
 Kubernetes
 kubectl
+Nginx
 FastAPI
 PostgreSQL
-gRPC
-GitHub Actions
+Redis
 Prometheus
 Grafana
+GitHub Actions

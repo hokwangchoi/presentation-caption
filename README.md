@@ -33,7 +33,7 @@ the handle.
 
 | Without | With |
 |---|---|
-| The API is written with Fast API, and it keeps its data in Postgresql. | The API is written with FastAPI, and it keeps its data in PostgreSQL. |
+| The pods run behind an **engine X** proxy, and we debug them with **Cubicle**. | The pods run behind an **Nginx** proxy, and we debug them with **kubectl**. |
 
 Other options: `--colors`, `--font-size`, `--position top`, `--source` for another microphone (see
 `pactl list short sources`), `--model small.en` for more accuracy on a fast CPU, and `--file talk.wav` to test with a
