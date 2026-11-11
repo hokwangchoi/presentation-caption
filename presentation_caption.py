@@ -41,12 +41,15 @@ Audio = npt.NDArray[np.float32]
 
 RATE = 16000
 FRAME = RATE // 50  # 20 ms, the unit of the voice detection
-# Whisper's known hallucinations on silence or noise: web addresses, video-outro phrases and sound tags
+# Whisper's known hallucinations on silence or noise: web addresses, video-outro phrases, sound tags like [BLANK_AUDIO]
+# or (music), even cut short, and punctuation alone
 HALLUCINATION = re.compile(
     r"www\.|https?:|\.(com|org|net)\b|thank(s| you) for watching|subscribe|subtitles|amara\.org|captions by|"
-    r"^\s*[\[(].*[\])]\s*$",
+    r"^\s*[\[(]|^\W*$",
     re.I,
 )
+# Sound tags and brackets left inside a sentence
+TAGS = re.compile(r"\s*[\[(][^\])]*[\])]?|[\[\]()]")
 # Color schemes, in the order of the colors button: text, its outline and the background (None: transparent)
 SCHEMES: dict[str, tuple[str, str | None, str | None]] = {
     "black-outlined": ("black", "white", None),
@@ -229,7 +232,7 @@ class Captioner:
         return [s for s in segments if s.text.strip() and not HALLUCINATION.search(s.text)]
 
     def _join(self, segments: list[Segment]) -> str:
-        text = " ".join(s.text.strip() for s in segments).strip()
+        text = TAGS.sub("", " ".join(s.text.strip() for s in segments)).strip()
         for pattern, term in self.fixes:
             text = pattern.sub(term, text)
         return text
