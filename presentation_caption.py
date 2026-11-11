@@ -491,10 +491,14 @@ class CaptionWindow:
         self.redraw()
 
     def leave(self, event: tk.Event[tk.Misc]) -> None:
+        # The controls stay a second after the mouse leaves, which also ignores stray events with the mouse still
+        self.root.after(1000, self.unhover)
+
+    def unhover(self) -> None:
         px, py = self.root.winfo_pointerxy()
         x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
-        if self.drag_offset or (x <= px < x + self.size[0] and y <= py < y + self.size[1]):
-            return  # onto a button, or dragging
+        if not self.hovered or self.drag_offset or (x <= px < x + self.size[0] and y <= py < y + self.size[1]):
+            return  # back over the captions, on a button, or dragging
         self.hovered = False
         for widget in [*self.buttons, self.grip]:
             widget.place_forget()
