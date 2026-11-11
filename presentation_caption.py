@@ -2,7 +2,9 @@
 every window, so sharing the whole screen shares the captions too.
 
 Run:   python3 presentation_caption.py [--vocab words.txt]
-Hover over the captions to show their controls: colors, font size, close, and a resize corner. Drag them to move.
+Hover over the captions to show their controls: colors, font size, finish, close, and a resize corner. Drag them to
+move.
+Finish saves the transcript of the talk to transcript-<date>-<time>.txt in the current folder and quits.
 Quit:  the close button, right-click, or Ctrl+C in the terminal.
 
 The transcript is also printed to the terminal, one line per sentence.
@@ -124,6 +126,11 @@ class Captioner:
         """The last sentences and the one being spoken."""
         with self.lock:
             return " ".join(self.done[-3:] + [self.partial]).strip()
+
+    def transcript(self) -> str:
+        """All the sentences so far, one per line, with the one being spoken."""
+        with self.lock:
+            return "\n".join(self.done + ([self.partial] if self.partial else [])) + "\n"
 
     def run(self, chunks: queue.Queue[Audio]) -> None:
         """Transcribes the sentence being spoken whenever new audio came in, until a pause ends it."""
@@ -303,6 +310,7 @@ class CaptionWindow:
             self._button("Colors", self.next_scheme),
             self._button("A-", lambda: self.zoom(-4)),
             self._button("A+", lambda: self.zoom(4)),
+            self._button("Finish", self.finish),
             self._button("Close", self.root.destroy),
         ]
         self.grip = tk.Frame(self.root, width=self.GRIP, height=self.GRIP, bg="darkgray", cursor="bottom_right_corner")
@@ -350,6 +358,14 @@ class CaptionWindow:
         self.scheme = names[(names.index(self.scheme) + 1) % len(names)]
         print(f"Colors: {self.scheme}", file=sys.stderr)
         self.redraw()
+
+    def finish(self) -> None:
+        """Saves the transcript of the talk in the current folder and quits."""
+        path = time.strftime("transcript-%Y%m%d-%H%M%S.txt")
+        with open(path, "w") as f:
+            f.write(self.captioner.transcript())
+        print(f"Transcript saved to {os.path.abspath(path)}", file=sys.stderr)
+        self.root.destroy()
 
     def zoom(self, step: int) -> None:
         self.font_size = max(16, min(160, self.font_size + step))

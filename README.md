@@ -26,8 +26,9 @@ python3 presentation_caption.py --vocab examples/web-service.txt
 ```
 
 Share your entire screen, not one window. Hover over the captions for the controls: **Colors**, **A-**, **A+**,
-**Close**, and a resize corner. Drag them to move. Before the first words, a small grey square at the bottom left is
-the handle.
+**Finish**, **Close**, and a resize corner. Drag them to move. Before the first words, a small grey square at the
+bottom left is the handle.
+**Finish** saves the transcript of the talk to `transcript-<date>-<time>.txt` in the folder you started it from.
 
 `--vocab` takes the terms of your talk, one per line, so they come out spelled your way:
 
