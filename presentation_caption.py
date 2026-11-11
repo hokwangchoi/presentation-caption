@@ -51,6 +51,7 @@ TENTATIVE = False
 # a fraction of a second apart agree on the same wrong guess of it
 HOLD = 0
 AGREE = 0.4  # seconds between two transcriptions that must agree on a word to confirm it
+LINE = 60  # characters per line at start: live captions read best in short lines, at about 10 words
 # Whisper's known hallucinations on silence or noise: web addresses, video-outro phrases, sound tags like [BLANK_AUDIO]
 # or (music), even cut short, and punctuation alone
 HALLUCINATION = re.compile(
@@ -98,6 +99,14 @@ def common_prefix(a: list[str], b: list[str]) -> int:
     while n < min(len(a), len(b)) and a[n].strip(string.punctuation).lower() == b[n].strip(string.punctuation).lower():
         n += 1
     return n
+
+
+def gpu_build() -> bool:
+    """Whether whisper.cpp was built for a GPU, where the larger small.en model keeps up with speech."""
+    import _pywhispercpp
+
+    info = _pywhispercpp.whisper_print_system_info()
+    return bool(re.search(r"\b(CUDA|METAL|VULKAN|HIP|SYCL)\b(?!\s*=\s*0)", info))
 
 
 def load_model(name: str, threads: int, models_dir: str | None) -> Model:
@@ -458,10 +467,11 @@ class CaptionWindow:
         ]
         self.grip = tk.Frame(self.root, width=self.GRIP, height=self.GRIP, bg="darkgray", cursor="bottom_right_corner")
         screen = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
-        mx, my, width, mh = monitor_at(*self.root.winfo_pointerxy()) or screen
+        mx, my, mw, mh = monitor_at(*self.root.winfo_pointerxy()) or screen
+        width = min(mw, int(self.font.getlength("e" * LINE)) + 2 * self.PAD + self.buttons_width())
         height = lines * self.line_height() + 2 * self.PAD
         y = my + 60 if position == "top" else my + mh - height - 60
-        self.root.geometry(f"{width}x{height}+{mx}+{y}")
+        self.root.geometry(f"{width}x{height}+{mx + (mw - width) // 2}+{y}")
         self.size = (0, 0)  # so that the first refresh draws the window, and cuts it to the handle
         self.image: object = None  # the PhotoImage shown, kept from garbage collection
         self.label.bind("<Enter>", self.enter)
@@ -625,7 +635,8 @@ def save_transcript(captioner: Captioner) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument(
-        "--model", default="base.en", help="Whisper model: tiny.en, base.en, small.en, ... (default %(default)s)"
+        "--model",
+        help="Whisper model: tiny.en, base.en, small.en, ... (default: small.en with a GPU, base.en without)",
     )
     parser.add_argument(
         "--language", default="en", help="spoken language (default %(default)s); models ending in .en are English only"
@@ -649,10 +660,11 @@ def main() -> None:
     parser.add_argument("--no-window", action="store_true", help="only print the transcript")
     args = parser.parse_args()
 
-    model = load_model(args.model, args.threads, args.models_dir)
+    name = args.model or ("small.en" if gpu_build() else "base.en")
+    model = load_model(name, args.threads, args.models_dir)
     captioner = Captioner(model, args.language, load_vocab(args.vocab))
     where = "the GPU and the whole window" if captioner.full_window else "the CPU"
-    print(f"Captions with Whisper {args.model} on {where}. Speak.", file=sys.stderr)
+    print(f"Captions with Whisper {name} on {where}. Speak.", file=sys.stderr)
     chunks: queue.Queue[Audio] = queue.Queue()
     stop = threading.Event()
     mic = None if args.file else Microphone(args.source)

@@ -16,8 +16,9 @@ cd presentation-caption
 pip install -r requirements.txt
 ```
 
-It runs on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp); the first run downloads the model
-(140 MB for `base.en`).
+It runs on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp), and on a GPU if you build whisper.cpp
+for one: it then uses the larger, more accurate `small.en` model. The first run downloads the model (140 MB for
+`base.en`, 470 MB for `small.en`).
 
 ## Use
 
@@ -40,7 +41,7 @@ the talk is saved to `transcript-<date>-<time>.txt` in the folder you started it
 | The pods run behind an **engine X** proxy, and we debug them with **Cubicle**. | The pods run behind an **Nginx** proxy, and we debug them with **kubectl**. |
 
 Other options: `--colors`, `--font-size`, `--position top`, `--source` for another microphone (see
-`pactl list short sources`), `--model small.en` for more accuracy on a fast CPU, and `--file talk.wav` to test with a
+`pactl list short sources`), `--model` to choose the Whisper model, and `--file talk.wav` to test with a
 16 kHz mono recording. See `--help`.
 
 ## License
