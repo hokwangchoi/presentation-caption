@@ -130,6 +130,9 @@ class Captioner:
         self.done: list[str] = []
         self.partial = ""
         self.lock = threading.Lock()
+        # Whisper encodes 30 s windows. The whole window is the most accurate, and fast on a GPU; where it is slow, as
+        # on most CPUs, only the audio there is gets encoded, many times faster for the few seconds of a sentence
+        self.full_window = self._time_full_window() < 0.15
 
     def text(self) -> str:
         """The last sentences and the one being spoken."""
@@ -142,18 +145,23 @@ class Captioner:
             return "\n".join(self.done + ([self.partial] if self.partial else [])) + "\n"
 
     def run(self, chunks: queue.Queue[Audio], stop: threading.Event) -> None:
-        """Transcribes the sentence being spoken whenever new audio came in, until a pause ends it. Returns once
-        `stop` is set and the transcription under way is over."""
+        """Transcribes the sentence being spoken every quarter second of new audio, until a pause ends it. Returns
+        once `stop` is set and the transcription under way is over."""
         buf = np.zeros(0, np.float32)
         while not stop.is_set():
-            try:
-                new = [chunks.get(timeout=0.1)]
-            except queue.Empty:
-                continue
+            new: list[Audio] = []
+            while sum(len(c) for c in new) < RATE // 4 and not stop.is_set():
+                try:
+                    new.append(chunks.get(timeout=0.1))
+                except queue.Empty:
+                    pass
             while not chunks.empty():
                 new.append(chunks.get())
+            if not new:
+                continue
+            added = sum(len(c) for c in new)
             buf = np.concatenate([buf, *new])
-            loud = np.flatnonzero(self._speech(buf, sum(len(c) for c in new)))
+            loud = np.flatnonzero(self._speech(buf, added))
             if not len(loud):
                 buf = buf[-RATE // 2 :]  # keep the start of a word that may be coming
                 continue
@@ -161,7 +169,7 @@ class Captioner:
                 buf = buf[loud[0] * FRAME - RATE // 4 :]
                 continue
             end = (loud[-1] + 1) * FRAME
-            if len(loud) * FRAME < 0.3 * RATE:  # a click or a breath, not speech yet
+            if len(loud) * FRAME < 0.2 * RATE:  # a click or a breath, not speech yet
                 if len(buf) - end > 0.6 * RATE:
                     buf = buf[end:]
                 continue
@@ -169,29 +177,47 @@ class Captioner:
             if len(buf) - end > 0.6 * RATE:  # a pause: the sentence is over
                 self._commit(segments)
                 buf = buf[end:]
-            elif len(buf) > 12 * RATE and len(segments) > 1:  # a long sentence: keep only its last part open
+            elif len(buf) > 8 * RATE and len(segments) > 1:  # a long sentence: keep only its last part open
                 self._commit(segments[:-1], self._join(segments[-1:]))
                 buf = buf[segments[-1].t0 * RATE // 100 :]  # t0 is in centiseconds
             elif len(buf) > 25 * RATE:
                 self._commit(segments)
                 buf = np.zeros(0, np.float32)
-            else:
+            elif len(text := self._join(segments)) < 20 * len(buf) // RATE + 20:  # longer is Whisper repeating itself
                 with self.lock:
-                    self.partial = self._join(segments)
+                    self.partial = text
 
     def _speech(self, audio: Audio, new: int) -> npt.NDArray[np.bool_]:
-        """Which 20 ms frames of `audio` are speech: louder than -50 dBFS and than four times the room's noise, the
-        quietest fifth of the recent frames. `new` samples at its end were not seen before."""
+        """Which 20 ms frames of `audio` are speech: louder than three times the room's noise, the quietest tenth of
+        the last 10 s, and than -50 dBFS. The threshold stays below -30 dBFS, so that talking from the start, before
+        any silence, is not taken for noise. `new` samples at its end were not seen before."""
         n = len(audio) // FRAME
         rms = np.sqrt(np.mean(audio[: n * FRAME].reshape(n, FRAME) ** 2, axis=1))
         self.levels.extend(rms[-(new // FRAME) :].tolist() if new >= FRAME else [])
-        noise = float(np.percentile(self.levels, 20)) if self.levels else 0.0
-        speech: npt.NDArray[np.bool_] = rms > max(4 * noise, 0.003)
+        noise = float(np.percentile(self.levels, 10)) if len(self.levels) >= 50 else 0.0
+        speech: npt.NDArray[np.bool_] = rms > min(max(3 * noise, 0.003), 0.03)
         return speech
 
+    def _time_full_window(self) -> float:
+        """Seconds to transcribe 1 s of silence with the whole window, after a first run that loads the model."""
+        silence = np.zeros(RATE, np.float32)
+        for _ in range(2):
+            start = time.monotonic()
+            self.model.transcribe(silence, language=self.language, no_context=True, audio_ctx=0)
+        return time.monotonic() - start
+
     def _transcribe(self, audio: Audio) -> list[Segment]:
+        # 50 positions of the window per second of audio, with a margin
+        context = 0 if self.full_window else min(1500, len(audio) * 50 // RATE + 64)
         segments = self.model.transcribe(
-            audio, language=self.language, initial_prompt=self.prompt, no_context=True, suppress_blank=True
+            audio,
+            language=self.language,
+            initial_prompt=self.prompt,
+            no_context=True,
+            suppress_blank=True,
+            audio_ctx=context,
+            temperature_inc=0.0,  # no slow retries at higher temperatures: the next update corrects a bad guess
+            max_tokens=len(audio) * 6 // RATE + 16,  # about twice the words of fast speech, to stop repetition loops
         )
         return [s for s in segments if s.text.strip() and not HALLUCINATION.search(s.text)]
 
@@ -370,7 +396,7 @@ class CaptionWindow:
             self.text, self.size = text, size
             self.redraw()
         self.root.lift()
-        self.root.after(150, self.refresh)
+        self.root.after(100, self.refresh)
 
     def next_scheme(self) -> None:
         names = list(SCHEMES)
@@ -507,7 +533,8 @@ def main() -> None:
 
     model = load_model(args.model, args.threads, args.models_dir)
     captioner = Captioner(model, args.language, load_vocab(args.vocab))
-    print(f"Captions with Whisper {args.model}. Speak.", file=sys.stderr)
+    where = "the GPU and the whole window" if captioner.full_window else "the CPU"
+    print(f"Captions with Whisper {args.model} on {where}. Speak.", file=sys.stderr)
     chunks: queue.Queue[Audio] = queue.Queue()
     stop = threading.Event()
     mic = None if args.file else Microphone(args.source)
