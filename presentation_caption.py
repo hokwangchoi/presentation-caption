@@ -445,8 +445,7 @@ class CaptionWindow:
     def lines(self) -> list[str]:
         """The last lines of the text that fit, wrapped to the width left of the buttons, so that showing them
         does not cover the text."""
-        buttons = sum(b.winfo_reqwidth() + 6 for b in self.buttons) + self.GRIP + 8
-        width = self.size[0] - self.PAD - buttons
+        width = self.size[0] - self.PAD - self.buttons_width()
         fit = max(1, (self.size[1] - 2 * self.PAD) // self.line_height())
         out: list[str] = []
         line = ""
@@ -495,12 +494,16 @@ class CaptionWindow:
             return
         self.hovered = True
         self.last_over = time.monotonic()
-        x = self.size[0] - self.GRIP - 8
-        for button in reversed(self.buttons):
-            x -= button.winfo_reqwidth() + 6
-            button.place(x=x, y=6)
+        x = self.GRIP + 8
+        for button in reversed(self.buttons):  # from the right edge, so that they follow it when resizing
+            x += button.winfo_reqwidth() + 6
+            button.place(relx=1.0, x=-x, y=6)
         self.grip.place(relx=1.0, rely=1.0, anchor="se")
         self.redraw()
+
+    def buttons_width(self) -> int:
+        """The width the buttons and the resize corner take at the right of the captions."""
+        return sum(b.winfo_reqwidth() + 6 for b in self.buttons) + self.GRIP + 8
 
     def unhover(self) -> None:
         self.hovered = False
@@ -523,7 +526,7 @@ class CaptionWindow:
 
     def resize(self, event: tk.Event[tk.Misc]) -> None:
         self.resizing = True
-        width = max(300, event.x_root - self.root.winfo_rootx())
+        width = max(self.buttons_width() + 200, event.x_root - self.root.winfo_rootx())  # the buttons and some words
         height = max(self.line_height() + 2 * self.PAD, event.y_root - self.root.winfo_rooty())
         self.root.geometry(f"{width}x{height}")
 
