@@ -2,12 +2,11 @@
 every window, so sharing the whole screen shares the captions too.
 
 Run:   python3 presentation_caption.py [--vocab words.txt]
-Hover over the captions to show their controls: colors, font size, finish, close, and a resize corner. Drag them to
-move.
-Finish saves the transcript of the talk to transcript-<date>-<time>.txt in the current folder and quits.
+Hover over the captions to show their controls: colors, font size, close, and a resize corner. Drag them to move.
 Quit:  the close button, right-click, or Ctrl+C in the terminal. After 2 s without new words, the captions clear.
 
-The transcript is also printed to the terminal, one line per sentence.
+The transcript is saved to transcript-<date>-<time>.txt in the current folder when the program quits, and printed to
+the terminal while you speak, one line per sentence.
 """
 
 from __future__ import annotations
@@ -365,7 +364,6 @@ class CaptionWindow:
             self._button("Colors", self.next_scheme),
             self._button("A-", lambda: self.zoom(-4)),
             self._button("A+", lambda: self.zoom(4)),
-            self._button("Finish", self.finish),
             self._button("Close", self.close),
         ]
         self.grip = tk.Frame(self.root, width=self.GRIP, height=self.GRIP, bg="darkgray", cursor="bottom_right_corner")
@@ -428,14 +426,6 @@ class CaptionWindow:
         self.scheme = names[(names.index(self.scheme) + 1) % len(names)]
         print(f"Colors: {self.scheme}", file=sys.stderr)
         self.redraw()
-
-    def finish(self) -> None:
-        """Saves the transcript of the talk in the current folder and quits."""
-        path = time.strftime("transcript-%Y%m%d-%H%M%S.txt")
-        with open(path, "w") as f:
-            f.write(self.captioner.transcript())
-        print(f"Transcript saved to {os.path.abspath(path)}", file=sys.stderr)
-        self.close()
 
     def zoom(self, step: int) -> None:
         self.font_size = max(16, min(160, self.font_size + step))
@@ -531,6 +521,17 @@ class CaptionWindow:
         self.root.geometry(f"{width}x{height}")
 
 
+def save_transcript(captioner: Captioner) -> None:
+    """Saves the transcript of the talk, if anything was said, in the current folder."""
+    text = captioner.transcript()
+    if not text.strip():
+        return
+    path = time.strftime("transcript-%Y%m%d-%H%M%S.txt")
+    with open(path, "w") as f:
+        f.write(text)
+    print(f"Transcript saved to {os.path.abspath(path)}", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument(
@@ -588,6 +589,7 @@ def main() -> None:
         if mic:
             mic.stop()
         worker.join()
+        save_transcript(captioner)
 
 
 if __name__ == "__main__":
