@@ -25,10 +25,13 @@ It runs on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp); 
 python3 presentation_caption.py --vocab examples/web-service.txt
 ```
 
-Share your entire screen, not one window. Hover over the captions for the controls: **Colors**, **A-**, **A+**,
-**Close**, and a resize corner. Drag them to move. Before the first words, a small grey square at the bottom left is
-the handle. After 2 s of silence, the captions clear, so that they do not mix with what you say next. When you quit,
-the transcript of the talk is saved to `transcript-<date>-<time>.txt` in the folder you started it from.
+Share your entire screen, not one window. The captions roll up in two lines of about 10 words, like live TV captions:
+each word appears about half a second after you say it, once Whisper is sure of it, and does not change after. After
+2 s of silence, they clear, so that they do not mix with what you say next.
+
+Hover over the captions for the controls: **Colors**, **A-**, **A+**, **Close**, and a resize corner. Drag them to
+move. Before the first words, a small grey square at the bottom left is the handle. When you quit, the transcript of
+the talk is saved to `transcript-<date>-<time>.txt` in the folder you started it from.
 
 `--vocab` takes the terms of your talk, one per line, so they come out spelled your way:
 

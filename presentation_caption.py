@@ -3,7 +3,7 @@ every window, so sharing the whole screen shares the captions too.
 
 Run:   python3 presentation_caption.py [--vocab words.txt]
 Hover over the captions to show their controls: colors, font size, close, and a resize corner. Drag them to move.
-Quit:  the close button, right-click, or Ctrl+C in the terminal. After 2 s without new words, the captions clear.
+Quit:  the close button, right-click, or Ctrl+C in the terminal. After 2 s of silence, the captions clear.
 
 The transcript is saved to transcript-<date>-<time>.txt in the current folder when the program quits, and printed to
 the terminal while you speak, one line per sentence.
@@ -41,6 +41,16 @@ Audio = npt.NDArray[np.float32]
 
 RATE = 16000
 FRAME = RATE // 50  # 20 ms, the unit of the voice detection
+UPDATE = 0.15  # seconds of new audio between two transcriptions of the sentence being spoken
+PAUSE = 0.8  # seconds without speech that end a sentence: shorter pauses, as to breathe, do not
+CLEAR = 2.0  # seconds of silence after which the captions clear, so that they do not mix with what comes next
+# Whether to show the newest words before two transcriptions agree on them: they appear 0.2 s sooner, but change
+# as Whisper changes its mind, which reads as the sentence restarting
+TENTATIVE = False
+# Words at the end of a transcription never confirmed: the last is often still being spoken, and two transcriptions
+# a fraction of a second apart agree on the same wrong guess of it
+HOLD = 0
+AGREE = 0.4  # seconds between two transcriptions that must agree on a word to confirm it
 # Whisper's known hallucinations on silence or noise: web addresses, video-outro phrases, sound tags like [BLANK_AUDIO]
 # or (music), even cut short, and punctuation alone
 HALLUCINATION = re.compile(
@@ -80,6 +90,14 @@ def collapse_repeats(text: str) -> str:
         out += words[i : i + size]
         i += size * count
     return " ".join(out)
+
+
+def common_prefix(a: list[str], b: list[str]) -> int:
+    """The number of words `a` and `b` start with in common, ignoring case and punctuation."""
+    n = 0
+    while n < min(len(a), len(b)) and a[n].strip(string.punctuation).lower() == b[n].strip(string.punctuation).lower():
+        n += 1
+    return n
 
 
 def load_model(name: str, threads: int, models_dir: str | None) -> Model:
@@ -143,7 +161,9 @@ def read_file(path: str, chunks: queue.Queue[Audio]) -> None:
 
 
 class Captioner:
-    """Turns the audio stream into sentences (`done`) and the sentence being spoken (`partial`)."""
+    """Turns the audio stream into sentences: `done` holds Whisper's final transcription of each, for the transcript,
+    and `shown_done` the words shown for each, which do not change once confirmed. `partial` is the sentence being
+    spoken, as shown."""
 
     def __init__(self, model: Model, language: str, vocab: list[str]) -> None:
         self.model = model
@@ -154,7 +174,12 @@ class Captioner:
         # Loudness of the last 10 s of 20 ms frames, to tell speech from the room's noise
         self.levels: collections.deque[float] = collections.deque(maxlen=50 * 10)
         self.done: list[str] = []
+        self.shown_done: list[str] = []
         self.partial = ""
+        self.latest = ""  # the latest transcription of the sentence being spoken
+        # Its earlier transcriptions, with their times, to confirm the words they agree on
+        self.history: collections.deque[tuple[float, list[str]]] = collections.deque(maxlen=50)
+        self.confirmed: list[str] = []  # the words of the sentence being spoken that stay as shown
         self.shown = 0  # the first sentence on screen: the earlier ones are cleared after a silence
         self.updated = time.monotonic()  # when the words last changed
         self.lock = threading.Lock()
@@ -165,20 +190,24 @@ class Captioner:
     def text(self) -> str:
         """The last sentences on screen and the one being spoken."""
         with self.lock:
-            return " ".join(self.done[self.shown :][-3:] + [self.partial]).strip()
+            return " ".join(self.shown_done[self.shown :][-3:] + [self.partial]).strip()
 
     def transcript(self) -> str:
-        """All the sentences so far, one per line, with the one being spoken."""
+        """All the sentences so far, with the one being spoken, one per line: a pause or a long sentence can end a
+        transcription in the middle of a sentence."""
         with self.lock:
-            return "\n".join(self.done + ([self.partial] if self.partial else [])) + "\n"
+            text = " ".join(self.done + [self.latest]).strip()
+        return re.sub(r"(?<=[.?!])\s+", "\n", text) + "\n"
 
     def run(self, chunks: queue.Queue[Audio], stop: threading.Event) -> None:
-        """Transcribes the sentence being spoken every quarter second of new audio, until a pause ends it, and clears
-        the screen after 2 s without new words. Returns once `stop` is set and the transcription under way is over."""
+        """Transcribes the sentence being spoken every `UPDATE` seconds of new audio, until a pause ends it, and clears
+        the screen after `CLEAR` seconds of silence. Returns once `stop` is set and the transcription under way is
+        over."""
         buf = np.zeros(0, np.float32)
+        quiet = 0  # samples since the last speech
         while not stop.is_set():
             new: list[Audio] = []
-            while sum(len(c) for c in new) < RATE // 4 and not stop.is_set():
+            while sum(len(c) for c in new) < UPDATE * RATE and not stop.is_set():
                 try:
                     new.append(chunks.get(timeout=0.1))
                 except queue.Empty:
@@ -189,26 +218,32 @@ class Captioner:
                 continue
             added = sum(len(c) for c in new)
             buf = np.concatenate([buf, *new])
-            loud = np.flatnonzero(self._speech(buf, added))
-            if time.monotonic() - self.updated > 2:  # so that the last words do not mix with the next ones
-                if self.partial:  # words left hanging, as when noise keeps the sentence open
-                    self._commit(self.partial)
+            speech = self._speech(buf, added)
+            loud = np.flatnonzero(speech)
+            quiet = len(buf) - (loud[-1] + 1) * FRAME if len(loud) else quiet + added
+            # Silence: `CLEAR` seconds since the last speech. Or, as when room noise sounds like speech, a second more
+            # without new words, under 0.2 s of speech in the last 1.5 s, and none in the last 0.5 s, when the next
+            # sentence would start. Then the screen clears, so that the last words do not mix with the next ones
+            talking = np.count_nonzero(speech[-75:]) * FRAME > 0.2 * RATE or speech[-25:].any()
+            if quiet > CLEAR * RATE or (time.monotonic() - self.updated > CLEAR + 1 and not talking):
+                if self.latest:  # words left hanging, as when noise keeps the sentence open
+                    self._commit(self.latest)
                     buf = buf[-RATE // 4 :]
                 with self.lock:
-                    self.shown = len(self.done)
+                    self.shown = len(self.shown_done)
             if not len(loud):
                 buf = buf[-RATE // 2 :]  # keep the start of a word that may be coming
                 continue
-            if loud[0] * FRAME > RATE // 2:  # drop the silence before the sentence
-                buf = buf[loud[0] * FRAME - RATE // 4 :]
+            if loud[0] * FRAME > RATE:  # drop the silence before the sentence, but for its quiet start
+                buf = buf[loud[0] * FRAME - RATE // 2 :]
                 continue
             end = (loud[-1] + 1) * FRAME
-            if len(loud) * FRAME < 0.2 * RATE:  # a click or a breath, not speech yet
-                if len(buf) - end > 0.6 * RATE:
+            if len(loud) * FRAME < 0.2 * RATE:  # a breath, not speech yet
+                if len(buf) - end > PAUSE * RATE:
                     buf = buf[end:]
                 continue
             segments = self._transcribe(buf)
-            if len(buf) - end > 0.6 * RATE:  # a pause: the sentence is over
+            if len(buf) - end > PAUSE * RATE:  # the sentence is over
                 self._commit(self._join(segments))
                 buf = buf[end:]
             elif len(buf) > 8 * RATE and len(segments) > 1:  # a long sentence: keep only its last part open
@@ -217,21 +252,24 @@ class Captioner:
             elif len(buf) > 25 * RATE:
                 self._commit(self._join(segments))
                 buf = np.zeros(0, np.float32)
-            elif len(text := self._join(segments)) < 20 * len(buf) // RATE + 20:  # longer is Whisper repeating itself
-                with self.lock:
-                    if text and text != self.partial:  # an empty guess, of noise alone, keeps the words shown
-                        self.partial = text
-                        self.updated = time.monotonic()
+            elif text := self._join(segments):  # an empty guess, of noise alone, keeps the words shown
+                if len(text) < 20 * len(buf) // RATE + 20:  # longer is Whisper repeating itself
+                    self._update(text)
 
     def _speech(self, audio: Audio, new: int) -> npt.NDArray[np.bool_]:
         """Which 20 ms frames of `audio` are speech: louder than three times the room's noise, the quietest tenth of
-        the last 10 s, and than -50 dBFS. The threshold stays below -30 dBFS, so that talking from the start, before
-        any silence, is not taken for noise. `new` samples at its end were not seen before."""
+        the last 10 s, and than -50 dBFS, for 60 ms or more, which clicks are shorter than. The threshold stays below
+        -30 dBFS, so that talking from the start, before any silence, is not taken for noise. `new` samples at its end
+        were not seen before."""
         n = len(audio) // FRAME
         rms = np.sqrt(np.mean(audio[: n * FRAME].reshape(n, FRAME) ** 2, axis=1))
         self.levels.extend(rms[-(new // FRAME) :].tolist() if new >= FRAME else [])
         noise = float(np.percentile(self.levels, 10)) if len(self.levels) >= 50 else 0.0
         speech: npt.NDArray[np.bool_] = rms > min(max(3 * noise, 0.003), 0.03)
+        edges = np.diff(np.concatenate([[0], speech.astype(np.int8), [0]]))
+        for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=True):
+            if stop - start < 3:
+                speech[start:stop] = False
         return speech
 
     def _time_full_window(self) -> float:
@@ -259,18 +297,46 @@ class Captioner:
 
     def _join(self, segments: list[Segment]) -> str:
         text = collapse_repeats(TAGS.sub("", " ".join(s.text.strip() for s in segments)).strip())
+        text = text.lstrip("- ")  # the dash of a line of dialogue, which the larger models write sometimes
         for pattern, term in self.fixes:
             text = pattern.sub(term, text)
         return text
 
-    def _commit(self, text: str, partial: str = "") -> None:
-        """Adds the sentence `text` to the transcript and starts the next one with `partial`."""
+    def _update(self, text: str) -> None:
+        """Shows `text`, the latest transcription of the sentence being spoken. The words it starts with in common
+        with a transcription of `AGREE` seconds earlier are confirmed and stay as shown (LocalAgreement-2): Whisper
+        often changes its mind about the last words, until it heard more of them. The newer words are shown after
+        them if `TENTATIVE`."""
+        words = text.split()
+        now = time.monotonic()
+        earlier = next((w for t, w in reversed(self.history) if now - t >= AGREE), [])
+        agreed = min(common_prefix(earlier, words), len(words) - HOLD)
+        self.confirmed += words[len(self.confirmed) : agreed]
+        self.history.append((now, words))
+        partial = " ".join(self.confirmed + (words[len(self.confirmed) :] if TENTATIVE else []))
+        with self.lock:
+            self.latest = text
+            if partial != self.partial:
+                self.partial = partial
+                self.updated = time.monotonic()
+
+    def _commit(self, text: str, rest: str = "") -> None:
+        """Ends the sentence being spoken with `text`, Whisper's final transcription of it, shown after the words
+        confirmed on screen, and starts the next one with the transcription `rest`."""
+        words = text.split()
+        shown = " ".join(self.confirmed[: len(words)] + words[len(self.confirmed) :])
+        self.confirmed = self.confirmed[len(words) :]  # those of `rest`, confirmed already
+        self.history.clear()
+        self.history.append((time.monotonic(), rest.split()))
         with self.lock:
             if text:
                 self.done.append(text)
+                self.shown_done.append(shown)
                 print(text, flush=True)
                 self.updated = time.monotonic()
-            self.partial = partial
+            self.latest = rest
+            tentative = rest.split()[len(self.confirmed) :] if TENTATIVE else []
+            self.partial = " ".join(self.confirmed + tentative)
 
 
 class Shape:
