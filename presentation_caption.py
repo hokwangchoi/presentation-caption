@@ -332,7 +332,7 @@ class CaptionWindow:
         height = lines * self.line_height() + 2 * self.PAD
         y = my + 60 if position == "top" else my + mh - height - 60
         self.root.geometry(f"{width}x{height}+{mx}+{y}")
-        self.size = (width, height)
+        self.size = (0, 0)  # so that the first refresh draws the window, and cuts it to the handle
         self.image: object = None  # the PhotoImage shown, kept from garbage collection
         self.label.bind("<Enter>", self.enter)
         self.root.bind("<Leave>", self.leave)
