@@ -83,15 +83,24 @@ def to_audio(pcm: bytes) -> Audio:
     return (np.frombuffer(pcm, np.int16) / 32768).astype(np.float32)
 
 
-def read_mic(source: str | None, chunks: queue.Queue[Audio]) -> None:
-    """Puts 100 ms chunks of 16 kHz mono audio from PulseAudio or PipeWire into `chunks`."""
-    cmd = ["parec", "--raw", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=50"]
-    if source:
-        cmd.append(f"--device={source}")
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE) as p:
-        assert p.stdout is not None
-        while chunk := p.stdout.read(RATE // 10 * 2):
+class Microphone:
+    """Records 16 kHz mono audio from PulseAudio or PipeWire with parec."""
+
+    def __init__(self, source: str | None) -> None:
+        cmd = ["parec", "--raw", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=50"]
+        if source:
+            cmd.append(f"--device={source}")
+        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def read(self, chunks: queue.Queue[Audio]) -> None:
+        """Puts 100 ms chunks of audio into `chunks` until stopped."""
+        assert self.process.stdout is not None
+        while chunk := self.process.stdout.read(RATE // 10 * 2):
             chunks.put(to_audio(chunk))
+
+    def stop(self) -> None:
+        self.process.terminate()
+        self.process.wait()
 
 
 def read_file(path: str, chunks: queue.Queue[Audio]) -> None:
@@ -132,11 +141,15 @@ class Captioner:
         with self.lock:
             return "\n".join(self.done + ([self.partial] if self.partial else [])) + "\n"
 
-    def run(self, chunks: queue.Queue[Audio]) -> None:
-        """Transcribes the sentence being spoken whenever new audio came in, until a pause ends it."""
+    def run(self, chunks: queue.Queue[Audio], stop: threading.Event) -> None:
+        """Transcribes the sentence being spoken whenever new audio came in, until a pause ends it. Returns once
+        `stop` is set and the transcription under way is over."""
         buf = np.zeros(0, np.float32)
-        while True:
-            new = [chunks.get()]
+        while not stop.is_set():
+            try:
+                new = [chunks.get(timeout=0.1)]
+            except queue.Empty:
+                continue
             while not chunks.empty():
                 new.append(chunks.get())
             buf = np.concatenate([buf, *new])
@@ -311,7 +324,7 @@ class CaptionWindow:
             self._button("A-", lambda: self.zoom(-4)),
             self._button("A+", lambda: self.zoom(4)),
             self._button("Finish", self.finish),
-            self._button("Close", self.root.destroy),
+            self._button("Close", self.close),
         ]
         self.grip = tk.Frame(self.root, width=self.GRIP, height=self.GRIP, bg="darkgray", cursor="bottom_right_corner")
         screen = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
@@ -329,7 +342,7 @@ class CaptionWindow:
         self.grip.bind("<B1-Motion>", self.resize)
         self.label.bind("<Button-4>", lambda e: self.zoom(4))  # scroll up and down
         self.label.bind("<Button-5>", lambda e: self.zoom(-4))
-        self.label.bind("<Button-3>", lambda e: self.root.destroy())
+        self.label.bind("<Button-3>", lambda e: self.close())
         self.root.after(50, self.refresh)
 
     def _button(self, label: str, action: Callable[[], object]) -> tk.Button:
@@ -338,8 +351,14 @@ class CaptionWindow:
         return tk.Button(self.root, text=label, command=action, padx=6, pady=0, cursor="hand2")
 
     def run(self) -> None:
-        signal.signal(signal.SIGINT, lambda *_: self.root.destroy())  # Ctrl+C, handled when `refresh` runs
+        """Shows the captions until closed."""
+        signal.signal(signal.SIGINT, lambda *_: self.close())  # Ctrl+C, handled when `refresh` runs
         self.root.mainloop()
+        self.root.destroy()
+
+    def close(self) -> None:
+        """Ends `run`. The window is destroyed after its callbacks, so that none runs on a destroyed window."""
+        self.root.quit()
 
     def line_height(self) -> int:
         return int(self.font.getbbox("Ag")[3] * 1.2)
@@ -365,7 +384,7 @@ class CaptionWindow:
         with open(path, "w") as f:
             f.write(self.captioner.transcript())
         print(f"Transcript saved to {os.path.abspath(path)}", file=sys.stderr)
-        self.root.destroy()
+        self.close()
 
     def zoom(self, step: int) -> None:
         self.font_size = max(16, min(160, self.font_size + step))
@@ -490,19 +509,31 @@ def main() -> None:
     captioner = Captioner(model, args.language, load_vocab(args.vocab))
     print(f"Captions with Whisper {args.model}. Speak.", file=sys.stderr)
     chunks: queue.Queue[Audio] = queue.Queue()
-    if args.file:
-        reader = threading.Thread(target=read_file, args=(args.file, chunks), daemon=True)
+    stop = threading.Event()
+    mic = None if args.file else Microphone(args.source)
+    if mic:
+        reader = threading.Thread(target=mic.read, args=(chunks,), daemon=True)
     else:
-        reader = threading.Thread(target=read_mic, args=(args.source, chunks), daemon=True)
+        reader = threading.Thread(target=read_file, args=(args.file, chunks), daemon=True)
+    worker = threading.Thread(target=captioner.run, args=(chunks, stop))
     reader.start()
-    threading.Thread(target=captioner.run, args=(chunks,), daemon=True).start()
+    worker.start()
     try:
         if args.no_window:
             reader.join()
+            while not chunks.empty():  # the end of the recording
+                time.sleep(0.1)
+            time.sleep(1)
         else:
             CaptionWindow(captioner, args.font_size, args.lines, args.position, args.colors).run()
     except KeyboardInterrupt:
         pass
+    finally:
+        # Exiting during a transcription aborts the program in CUDA: let the one under way finish
+        stop.set()
+        if mic:
+            mic.stop()
+        worker.join()
 
 
 if __name__ == "__main__":
