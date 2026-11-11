@@ -20,6 +20,7 @@ import queue
 import re
 import shutil
 import signal
+import string
 import subprocess
 import sys
 import threading
@@ -56,6 +57,29 @@ SCHEMES: dict[str, tuple[str, str | None, str | None]] = {
     "black-on-white": ("black", None, "white"),
     "white-on-black": ("white", None, "black"),
 }
+
+
+def collapse_repeats(text: str) -> str:
+    """Keeps once a word or a phrase of up to 4 words repeated 4 or more times in a row: Whisper sometimes loops on
+    one, as "heh, heh, heh, ..." after a single laugh."""
+    words = text.split()
+    keys = [w.strip(string.punctuation).lower() for w in words]
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        size, count = 1, 1
+        for n in range(1, 5):
+            repeats = 1
+            while (
+                i + (repeats + 1) * n <= len(words) and keys[i + repeats * n : i + (repeats + 1) * n] == keys[i : i + n]
+            ):
+                repeats += 1
+            if repeats >= 4:
+                size, count = n, repeats
+                break
+        out += words[i : i + size]
+        i += size * count
+    return " ".join(out)
 
 
 def load_model(name: str, threads: int, models_dir: str | None) -> Model:
@@ -234,7 +258,7 @@ class Captioner:
         return [s for s in segments if s.text.strip() and not HALLUCINATION.search(s.text)]
 
     def _join(self, segments: list[Segment]) -> str:
-        text = TAGS.sub("", " ".join(s.text.strip() for s in segments)).strip()
+        text = collapse_repeats(TAGS.sub("", " ".join(s.text.strip() for s in segments)).strip())
         for pattern, term in self.fixes:
             text = pattern.sub(term, text)
         return text
