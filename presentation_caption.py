@@ -5,7 +5,7 @@ Run:   python3 presentation_caption.py [--vocab words.txt]
 Hover over the captions to show their controls: colors, font size, finish, close, and a resize corner. Drag them to
 move.
 Finish saves the transcript of the talk to transcript-<date>-<time>.txt in the current folder and quits.
-Quit:  the close button, right-click, or Ctrl+C in the terminal.
+Quit:  the close button, right-click, or Ctrl+C in the terminal. After 2 s of silence, the captions are cleared.
 
 The transcript is also printed to the terminal, one line per sentence.
 """
@@ -129,15 +129,16 @@ class Captioner:
         self.levels: collections.deque[float] = collections.deque(maxlen=50 * 10)
         self.done: list[str] = []
         self.partial = ""
+        self.shown = 0  # the first sentence on screen: the earlier ones are cleared after a silence
         self.lock = threading.Lock()
         # Whisper encodes 30 s windows. The whole window is the most accurate, and fast on a GPU; where it is slow, as
         # on most CPUs, only the audio there is gets encoded, many times faster for the few seconds of a sentence
         self.full_window = self._time_full_window() < 0.15
 
     def text(self) -> str:
-        """The last sentences and the one being spoken."""
+        """The last sentences on screen and the one being spoken."""
         with self.lock:
-            return " ".join(self.done[-3:] + [self.partial]).strip()
+            return " ".join(self.done[self.shown :][-3:] + [self.partial]).strip()
 
     def transcript(self) -> str:
         """All the sentences so far, one per line, with the one being spoken."""
@@ -145,9 +146,10 @@ class Captioner:
             return "\n".join(self.done + ([self.partial] if self.partial else [])) + "\n"
 
     def run(self, chunks: queue.Queue[Audio], stop: threading.Event) -> None:
-        """Transcribes the sentence being spoken every quarter second of new audio, until a pause ends it. Returns
-        once `stop` is set and the transcription under way is over."""
+        """Transcribes the sentence being spoken every quarter second of new audio, until a pause ends it, and clears
+        the screen after 2 s of silence. Returns once `stop` is set and the transcription under way is over."""
         buf = np.zeros(0, np.float32)
+        quiet = 0  # samples since the last speech
         while not stop.is_set():
             new: list[Audio] = []
             while sum(len(c) for c in new) < RATE // 4 and not stop.is_set():
@@ -162,6 +164,11 @@ class Captioner:
             added = sum(len(c) for c in new)
             buf = np.concatenate([buf, *new])
             loud = np.flatnonzero(self._speech(buf, added))
+            quiet = len(buf) - (loud[-1] + 1) * FRAME if len(loud) else quiet + added
+            if quiet > 2 * RATE:  # so that the last words do not mix with the next ones
+                with self.lock:
+                    if not self.partial:
+                        self.shown = len(self.done)
             if not len(loud):
                 buf = buf[-RATE // 2 :]  # keep the start of a word that may be coming
                 continue
